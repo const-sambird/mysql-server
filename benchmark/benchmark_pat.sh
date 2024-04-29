@@ -1,1 +1,1 @@
-mysql -u root -h 127.0.0.1 < benchmark_pat.sql
+mysql -u root -h 127.0.0.1 < benchmark_pat.sql > pat_results.txt

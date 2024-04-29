@@ -1734,6 +1734,7 @@ void instantiate_index(unordered_map<string, vector<my_off_t>> *dictionary, File
       ++row_offset;
     }
     ++ptr; // move past ,
+    ++row_offset;
     *word_ptr = '\0';
     string word = string(word_buffer);
     if (!dictionary->contains(word))
@@ -1744,9 +1745,10 @@ void instantiate_index(unordered_map<string, vector<my_off_t>> *dictionary, File
       found_offset = (my_off_t) strtoull(ptr, NULL, 10);
       dictionary->at(word).push_back(found_offset);
       ++ptr; // skip ','
-      row_offset += ((ULL_BASE_10_MAX_LENGTH + 3) * sizeof(char)); // skip ',' '\n'
+      row_offset += ((ULL_BASE_10_MAX_LENGTH + 1) * sizeof(char)); // skip ',' '\n'
     }
     ++ptr; // skip '\n'
+    ++row_offset;
     if (*ptr == -1)
       break;
   }

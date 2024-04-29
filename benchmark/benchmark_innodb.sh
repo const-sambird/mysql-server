@@ -1,1 +1,1 @@
-mysql -u root -h 127.0.0.1 < benchmark_innodb.sql
+mysql -u root -h 127.0.0.1 < benchmark_innodb.sql > innodb_results.txt
