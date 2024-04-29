@@ -37,7 +37,10 @@
 #include "sql/field.h"
 #include "storage/pattree/transparent_file.h"
 
+// we only ever have one column indexed
 #define INV_MAX_KEY 1
+// another product of this being a proof of concept. we presume we're never getting a word
+// longer than 100 characters
 #define INV_MAX_KEY_LENGTH 100 * sizeof(char)
 
 using std::vector;
@@ -54,6 +57,9 @@ using std::string;
 
 #define ULL_BASE_10_MAX_LENGTH 20
 
+// a node in the pat tree
+// key is (the suffix of) the word stored here,
+// offsets are the offsets of the rows with that word.
 class Node {
 public:
     string key;
@@ -62,14 +68,17 @@ public:
     Node(const string& key = "") : key(key) {}
 };  
 
+/*
+  this is the 'state', stored in TINA_SHARE, but bits related to the index
+*/
 struct index_share {
-  Node* root;
-  bool should_index_all_rows;
-  bool dict_dirty;
+  Node* root; // < the root node of the pat tree
+  bool should_index_all_rows; // should we rebuild the index? (read from file)
+  bool dict_dirty; // has the tree been modified (and we should write it to disk on close)?
   string column_name;
-  File index_file;
-  string last_key;
-  int positions_read;
+  File index_file; // the index file handler
+  string last_key; // the key we're trying to find (see ft_init_ext and ft_read)
+  int positions_read; // how many offsets we've read from a key (see ft_read)
 };
 
 struct TINA_SHARE {
@@ -161,6 +170,8 @@ class ha_pattree : public handler {
     return (HA_NO_TRANSACTIONS | HA_NO_AUTO_INCREMENT | HA_BINLOG_ROW_CAPABLE |
             HA_BINLOG_STMT_CAPABLE | HA_CAN_REPAIR | HA_CAN_FULLTEXT );
   }
+  // note the references to index and keys here are only about non-fulltext indices
+  // which we are not implementing
   ulong index_flags(uint, uint, bool) const override {
     /*
       We will never have indexes so this will never be called(AKA we return
@@ -227,14 +238,7 @@ class ha_pattree : public handler {
   int find_current_row(uchar *buf);
   int chain_append();
 
-  bool is_text_field(enum_field_types type);
-  /*int index_read_map(uchar* buf, const uchar* key, key_part_map keypart_map, enum ha_rkey_function find_flag) override;
-  int index_read_idx_map(uchar* buf, uint idx, const uchar* key, key_part_map keypart_map, enum ha_rkey_function find_flag) override;
-  int index_read_last_map(uchar* buf, const uchar* key, key_part_map keypart_map) override;
-  int index_next(uchar* buf) override;
-  int index_prev(uchar* buf) override;
-  int index_first(uchar* buf) override;
-  int index_last(uchar* buf) override;*/
+
   uint max_supported_keys() const override { return INV_MAX_KEY; }
   uint max_supported_key_length() const override { return INV_MAX_KEY_LENGTH; }
   void insert_element(const std::string word, const my_off_t offset);

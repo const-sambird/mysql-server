@@ -37,7 +37,10 @@
 #include "sql/field.h"
 #include "storage/inverted/transparent_file.h"
 
+// we only ever have one column indexed
 #define INV_MAX_KEY 1
+// another product of this being a proof of concept. we presume we're never getting a word
+// longer than 100 characters
 #define INV_MAX_KEY_LENGTH 100 * sizeof(char)
 
 using std::vector;
@@ -54,14 +57,17 @@ using std::string;
 
 #define ULL_BASE_10_MAX_LENGTH 20
 
+/*
+  this is the 'state', stored in TINA_SHARE, but bits related to the index
+*/
 struct index_share {
-  unordered_map<string, vector<my_off_t>> *dictionary;
-  bool should_index_all_rows;
-  bool dict_dirty;
+  unordered_map<string, vector<my_off_t>> *dictionary; // < the inverted index, stored in memory
+  bool should_index_all_rows; // < should we rebuild the index?
+  bool dict_dirty; // < has the dictionary been modified (and we need to store it to disk)?
   string column_name;
-  File index_file;
-  string last_key;
-  int positions_read;
+  File index_file; // < the handler for the index file
+  string last_key; // < the key we're currently trying to find (see ft_init_ext and ft_read)
+  int positions_read; // < how many offsets we've read (see ft_read)
 };
 
 struct TINA_SHARE {
@@ -140,7 +146,6 @@ class ha_inverted : public handler {
   int open_update_temp_file_if_needed();
   int init_tina_writer();
   int init_data_file();
-  //void instantiate_index(unordered_map<string, vector<my_off_t>> dictionary, File index_file);
 
  public:
   ha_inverted(handlerton *hton, TABLE_SHARE *table_arg);
@@ -154,6 +159,8 @@ class ha_inverted : public handler {
     return (HA_NO_TRANSACTIONS | HA_NO_AUTO_INCREMENT | HA_BINLOG_ROW_CAPABLE |
             HA_BINLOG_STMT_CAPABLE | HA_CAN_REPAIR | HA_CAN_FULLTEXT );
   }
+  // note the references to index and keys here are only about non-fulltext indices
+  // which we are not implementing
   ulong index_flags(uint, uint, bool) const override {
     /*
       We will never have indexes so this will never be called(AKA we return
@@ -220,14 +227,6 @@ class ha_inverted : public handler {
   int find_current_row(uchar *buf);
   int chain_append();
 
-  bool is_text_field(enum_field_types type);
-  /*int index_read_map(uchar* buf, const uchar* key, key_part_map keypart_map, enum ha_rkey_function find_flag) override;
-  int index_read_idx_map(uchar* buf, uint idx, const uchar* key, key_part_map keypart_map, enum ha_rkey_function find_flag) override;
-  int index_read_last_map(uchar* buf, const uchar* key, key_part_map keypart_map) override;
-  int index_next(uchar* buf) override;
-  int index_prev(uchar* buf) override;
-  int index_first(uchar* buf) override;
-  int index_last(uchar* buf) override;*/
   uint max_supported_keys() const override { return INV_MAX_KEY; }
   uint max_supported_key_length() const override { return INV_MAX_KEY_LENGTH; }
   void insert_element(const std::string word, const my_off_t offset);

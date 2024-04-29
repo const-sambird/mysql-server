@@ -21,31 +21,10 @@
   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
 
 /*
-  Make sure to look at ha_pattree.h for more details.
+  PATTREE storage engine, based on the CSV engine, `storage/csv/ha_tina.cc`, but with the
+  addition of support for fulltext indexing implemented using a PAT tree.
 
-  First off, this is a play thing for me, there are a number of things
-  wrong with it:
-    *) It was designed for csv and therefore its performance is highly
-       questionable.
-    *) Indexes have not been implemented. This is because the files can
-       be traded in and out of the table directory without having to worry
-       about rebuilding anything.
-    *) NULLs and "" are treated equally (like a spreadsheet).
-    *) There was in the beginning no point to anyone seeing this other
-       then me, so there is a good chance that I haven't quite documented
-       it well.
-    *) Less design, more "make it work"
-
-  Now there are a few cool things with it:
-    *) Errors can result in corrupted data files.
-    *) Data files can be read by spreadsheets directly.
-
-TODO:
- *) Move to a block system for larger files
- *) Error recovery, its all there, just need to finish it
- *) Document how the chains work.
-
- -Brian
+  This a modification of `storage/inverted/ha_inverted.cc` so some vestigial parts may exist
 */
 
 #include "storage/pattree/ha_pattree.h"
@@ -87,6 +66,10 @@ using std::unordered_map;
 #define TINA_CHECK_HEADER 254  // The number we use to determine corruption
 #define BLOB_MEMROOT_ALLOC_SIZE 8192
 
+/*
+ this is the size of the index file. 65536 holds ~1000 words
+ TODO: come up with a better heuristic for defining this
+*/
 #define INDEX_BUFFER_SIZE 65536
 
 /* The file extension */
@@ -272,6 +255,7 @@ static TINA_SHARE *get_share(const char *table_name, TABLE *) {
         read_meta_file(share->meta_file, &share->rows_recorded, share))
       share->crashed = true;
     
+    // create the index structure. this will remain empty until we create an index
     share->index = new index_share;
     share->index->index_file = mysql_file_open(csv_key_file_index, index_file_name, O_RDWR | O_CREAT, MYF(MY_WME));
     share->index->root = new Node();
@@ -982,9 +966,17 @@ int ha_pattree::write_row(uchar *buf) {
 
   ha_statistic_increment(&System_status_var::ha_write_count);
 
+  /*
+    here, we're looping through every field to figure out which one (if any)
+    is the one we've constructed the index on. when we find that row, we'll
+    add its contents to the index.
+  */
   for (Field **field = table->field; *field; field++) {
+    // only one column is ever indexed (see ha_pattree::max_supported_keys)
+    // so we're alright to ignore the details of *which* column this is
     if ((*field)->m_indexed) {
-      share->index->dict_dirty = true;
+      share->index->dict_dirty = true; // write tree on table close
+      // again unsure my_malloc is the way to go here
       String* tmp_buf = (String*) my_malloc(csv_key_memory_row, 100 * sizeof(char), MYF(MY_WME));
       String* content = (*field)->val_str(tmp_buf);
       read_and_index(string(content->c_ptr()), local_saved_data_file_length);
@@ -1208,6 +1200,7 @@ int ha_pattree::rnd_next(uchar *buf) {
   if ((rc = find_current_row(buf))) goto end;
 
   for (Field **field = table->field; *field; field++) {
+    // rebuild the tree if we haven't opened it yet
     if (share->index->should_index_all_rows && (*field)->m_indexed) {
       // we should only ever have one index - we defined that limit in
       // the header file, and mysql should enforce it. so if this field has
@@ -1616,18 +1609,6 @@ int ha_pattree::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *,
     }
   }
 
-  
-  /*
-    check for indices!
-  */
-  KEY* this_key = table_arg->key_info; ++this_key; --this_key;
-  /*if (this_key != nullptr && this_key->algorithm == HA_KEY_ALG_FULLTEXT) {
-    if (!(share->has_index)) {
-      share->has_index = true;
-      share->should_index_all_rows = true;
-    }
-  }*/
-
   if ((create_file =
            mysql_file_create(csv_key_file_metadata,
                              fn_format(name_buff, name, "", CSM_EXT,
@@ -1707,13 +1688,27 @@ bool ha_pattree::check_if_incompatible_data(HA_CREATE_INFO *, uint) {
 }
 
 /* start exclusively modified code though i guess i could just diff it */
-bool ha_pattree::is_text_field(enum_field_types type) {
-  DBUG_TRACE;
-  return (type == MYSQL_TYPE_VARCHAR ||
-   type == MYSQL_TYPE_VAR_STRING ||
-   type == MYSQL_TYPE_STRING);
-}
 
+/*
+  read the PAT tree from disk. the tree is stored in the same format
+  as the inverted index, which adds nontrivial processing time both serialising
+  and deserialising the tree. i'm certain there's a better way to do this (and for
+  very small tables it runs the risk of defeating the purpose of a PAT tree) but
+  i think this is still a proof of concept.
+
+  to repeat from ha_inverted.cc:
+
+  the index file is structured like:
+
+  word 0 , offset 0 , offset 1 , offset 2 , \n
+  word 1 , offset 0 , offset 1 , \n
+  ... etc
+  word n , offset 0 , ... , offset n , \n [0xFF] \n
+
+  where each offset is a reference to a row position in the data file. each line has one word and
+  a variable number of offsets. commas and newlines are delimiters, and when we hit an 0xFF byte we
+  know we are finished.
+*/
 void instantiate_pattree(Node *root, File index_file) {
   char index_buffer[INDEX_BUFFER_SIZE];
   char *ptr;
@@ -1727,10 +1722,12 @@ void instantiate_pattree(Node *root, File index_file) {
     char word_buffer[INV_MAX_KEY_LENGTH];
     char *word_ptr = word_buffer;
     ptr = index_buffer;
+    // seek to the row offset, which should be the start of the row after the one we've just read
      mysql_file_seek(index_file, row_offset, MY_SEEK_SET, MYF(0));
      if (mysql_file_read(index_file, (uchar *)index_buffer, INDEX_BUFFER_SIZE, 0) >
       INDEX_BUFFER_SIZE)
       break;
+    // read in the word, character at a time
     for (; *ptr != ','; ++ptr) {
       *word_ptr = *ptr;
       ++word_ptr;
@@ -1741,6 +1738,9 @@ void instantiate_pattree(Node *root, File index_file) {
     *word_ptr = '\0';
     string word = string(word_buffer);
     my_off_t found_offset;
+    // we've left 20 bytes (ULL_BASE_10_MAX_LENGTH) for each offset because
+    // my_off_t is an unsigned long long int and if we're storing it in decimal
+    // its max value is 20 digits long
     for (; *ptr != '\n'; ptr += (ULL_BASE_10_MAX_LENGTH * sizeof(char))) {
       *(ptr + (ULL_BASE_10_MAX_LENGTH * sizeof(char))) = '\0';
       found_offset = (my_off_t) strtoull(ptr, NULL, 10);
@@ -1751,11 +1751,14 @@ void instantiate_pattree(Node *root, File index_file) {
     }
     ++ptr; // skip '\n'
     ++row_offset;
-    if (*ptr == -1)
+    if (*ptr == -1) // stop byte
       break;
   }
 }
 
+/*
+  write the PAT tree. see serialise_tree
+*/
 void write_pattree(Node *root, File index_file) {
   string serialised = serialise_tree(root, "");
   serialised.erase(0, 1); //remove the first \n
@@ -1766,6 +1769,13 @@ void write_pattree(Node *root, File index_file) {
   mysql_file_write(index_file, (uchar*) ptr, INDEX_BUFFER_SIZE, 0);
 }
 
+/*
+  retrieve ranking.
+  if we're at this point, it means we've found an offset that matches the key, so
+  we should always return 1 (meaning the key was found in this row).
+
+  in future, we could vary this by the number of hits in this row (ie, larger number = more occurrences of this word)
+*/
 static float inverted_fts_retrieve_ranking(FT_INFO*) {
   DBUG_TRACE;
   return 1.0f;
@@ -1775,6 +1785,9 @@ static void inverted_fts_close_ranking(FT_INFO *) {
   DBUG_TRACE;
 }
 
+/*
+  return 1 (see inverted_fts_retrieve_ranking)
+*/
 static float inverted_fts_find_ranking(FT_INFO *, uchar * uc, uint ui) {
   DBUG_TRACE;
   DBUG_PRINT("info", ("find ranking uchar* : %s uint : %d", uc, ui));
@@ -1784,6 +1797,15 @@ static float inverted_fts_find_ranking(FT_INFO *, uchar * uc, uint ui) {
 
 const struct _ft_vft ft_vft_result = {nullptr, inverted_fts_find_ranking, inverted_fts_close_ranking, inverted_fts_retrieve_ranking, nullptr};
 
+/*
+  entry point for an index lookup.
+
+  uint flags  < honestly i don't know the significance but for this it doesn't seem to matter
+  uint inx    < the index number, but as we will only ever have at most 1 (and we certainly
+                have exactly one if this method is being called) it may be ignored
+  String *key < the word to look up. we need to store this because we'll be calling ft_read
+                for each offset in the node, and this won't be passed to it
+*/
 FT_INFO* ha_pattree::ft_init_ext(uint flags, uint inx, String *key) {
   DBUG_TRACE;
   DBUG_PRINT("info", ("init fulltext idx with flags %X , index %d , key %s", flags, inx, key->c_ptr()));
@@ -1800,6 +1822,9 @@ FT_INFO* ha_pattree::ft_init_ext(uint flags, uint inx, String *key) {
   return fts_hdl;
 }
 
+/*
+  called at the start of a fulltext lookup.
+*/
 int ha_pattree::ft_init() {
   DBUG_TRACE;
   if (!(share->has_index)) {
@@ -1809,14 +1834,23 @@ int ha_pattree::ft_init() {
   return rnd_init();
 }
 
+/*
+  called every time we have an offset to read. we should already have the key from
+  ft_init_ext, and now we want to read row data into buf.
+*/
 int ha_pattree::ft_read(uchar* buf) {
   DBUG_TRACE;
   DBUG_PRINT("info", ("ft_read with buf: [%p] %s", buf, buf));
+  // get the offsets. if the key isn't in the tree it will
+  // return an empty vector
   vector<my_off_t> offsets = find_element(share->index->root, share->index->last_key);
+  // not found
   if (offsets.size() == 0)
     return HA_ERR_END_OF_FILE;
+  // have we already read all of the rows matching this key? if so, stop reading and return what we've got
   if ((size_t) (share->index->positions_read + 1) > offsets.size())
     return HA_ERR_END_OF_FILE;
+  // otherwise, get the next offset and read the row data there
   my_off_t pos = offsets.at(share->index->positions_read);
   ++(share->index->positions_read);
   current_position = pos;
@@ -1838,6 +1872,9 @@ void ha_pattree::insert_element(const string word, const my_off_t offset) {
     insert_element_internal(share->index->root, word, offset);
 }
 
+/*
+  traverse the PAT tree to find the element with key str.
+*/
 vector<my_off_t> ha_pattree::find_element(Node* root, const string str) {
   Node* current = root;
 
@@ -1858,6 +1895,7 @@ vector<my_off_t> ha_pattree::find_element(Node* root, const string str) {
         if (i == str.length()) {
           return current->offsets;
         } else {
+          // we have not exhausted the key. keep going
           return find_element(current, str.substr(i, str.length()));
         }
         break;
@@ -1874,9 +1912,13 @@ vector<my_off_t> ha_pattree::find_element(Node* root, const string str) {
     }
   }
 
+  // should never be reached, but if we're here, we didn't find anything
   return vector<unsigned long long>();
 }
 
+/*
+  static method for insertion - insert offset at word
+*/
 void insert_element_internal(Node* root, const string word, const my_off_t offset) {
   Node* current = root;
 
@@ -1910,6 +1952,7 @@ void insert_element_internal(Node* root, const string word, const my_off_t offse
         if (i == word.length()) {
           current->offsets.push_back(offset);
         } else {
+          // continue traversal
           insert_element_internal(current, word.substr(i, word.length()), offset);
         }
         break;
@@ -1927,6 +1970,9 @@ void insert_element_internal(Node* root, const string word, const my_off_t offse
   }
 }
 
+/*
+  does parent have a child node whose key begins with ch?
+*/
 Node* find_child(Node* parent, char ch) {
   for (Node* child : parent->children) {
     if (child->key[0] == ch) {
@@ -1936,11 +1982,20 @@ Node* find_child(Node* parent, char ch) {
   return nullptr;
 }
 
+/*
+  essentially this extracts all of the leaf nodes and puts them into a string
+  along with their offsets in a way that we can read them back again.
+
+  this is probably not a very good way to do this! it does not preserve the
+  tree structure and requires it to be rebuilt. but for sufficiently large volumes of
+  lookups it shouldn't matter too much.
+*/
 string serialise_tree(Node *root, string prefix) {
-  string full_name = prefix;
-  full_name.append(root->key);
+  string full_name = prefix; // what we've already got (because only suffixes are stored)
+  full_name.append(root->key); // this is the full word stored at this node
   string result;
   if (root->offsets.size() > 0) {
+    // append the offsets here if we have any
     result.append(full_name);
     result.append(",");
     for (auto off : root->offsets) {
@@ -1952,6 +2007,8 @@ string serialise_tree(Node *root, string prefix) {
   }
   result.append("\n");
   for (auto child : root->children) {
+    // and traverse the children. it doesn't really matter what order we do this in
+    // because we'll rebuild the tree from the wordlist anyway
     result.append(serialise_tree(child, full_name));
   }
   return result;
