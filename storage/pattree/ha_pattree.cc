@@ -21,7 +21,7 @@
   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
 
 /*
-  Make sure to look at ha_inverted.h for more details.
+  Make sure to look at ha_pattree.h for more details.
 
   First off, this is a play thing for me, there are a number of things
   wrong with it:
@@ -48,7 +48,7 @@ TODO:
  -Brian
 */
 
-#include "storage/inverted/ha_inverted.h"
+#include "storage/pattree/ha_pattree.h"
 
 #include <fcntl.h>
 #include <mysql/plugin.h>
@@ -99,15 +99,18 @@ static TINA_SHARE *get_share(const char *table_name, TABLE *table);
 static int free_share(TINA_SHARE *share);
 static int read_meta_file(File meta_file, ha_rows *rows, TINA_SHARE* s);
 static int write_meta_file(File meta_file, ha_rows rows, TINA_SHARE* s, bool dirty);
-void instantiate_index(unordered_map<string, vector<my_off_t>> *dictionary, File index_file);
-void write_index(unordered_map<string, vector<my_off_t>> *dictionary, File index_file);
+void instantiate_pattree(Node *root, File index_file);
+void write_pattree(Node *root, File index_file);
+void insert_element_internal(Node *root, const string word, const my_off_t offset);
+Node* find_child(Node *parent, char ch);
+string serialise_tree(Node *root, string prefix);
 
-extern "C" void inv_tina_get_status(void *param, int concurrent_insert);
-extern "C" void inv_tina_update_status(void *param);
-extern "C" bool inv_tina_check_status(void *param);
+extern "C" void pat_tina_get_status(void *param, int concurrent_insert);
+extern "C" void pat_tina_update_status(void *param);
+extern "C" bool pat_tina_check_status(void *param);
 
 /* Stuff for shares */
-mysql_mutex_t inv_tina_mutex;
+mysql_mutex_t pat_tina_mutex;
 static unique_ptr<collation_unordered_multimap<string, TINA_SHARE *>>
     tina_open_tables;
 static handler *tina_create_handler(handlerton *hton, TABLE_SHARE *table,
@@ -131,7 +134,7 @@ static PSI_memory_key csv_key_memory_row;
 
 static PSI_mutex_key csv_key_mutex_tina, csv_key_mutex_TINA_SHARE_mutex;
 
-static PSI_mutex_info all_inv_tina_mutexes[] = {
+static PSI_mutex_info all_pat_tina_mutexes[] = {
     {&csv_key_mutex_tina, "tina", PSI_FLAG_SINGLETON, 0, PSI_DOCUMENT_ME},
     {&csv_key_mutex_TINA_SHARE_mutex, "TINA_SHARE::mutex", 0, 0,
      PSI_DOCUMENT_ME}};
@@ -158,8 +161,8 @@ static void init_tina_psi_keys(void) {
   const char *category = "csv";
   int count;
 
-  count = static_cast<int>(array_elements(all_inv_tina_mutexes));
-  mysql_mutex_register(category, all_inv_tina_mutexes, count);
+  count = static_cast<int>(array_elements(all_pat_tina_mutexes));
+  mysql_mutex_register(category, all_pat_tina_mutexes, count);
 
   count = static_cast<int>(array_elements(all_tina_files));
   mysql_file_register(category, all_tina_files, count);
@@ -173,7 +176,7 @@ static void init_tina_psi_keys(void) {
   If frm_error() is called in table.cc this is called to find out what file
   extensions exist for this handler.
 */
-static const char *ha_inverted_exts[] = {CSV_EXT, CSM_EXT, CSI_EXT, NullS};
+static const char *ha_pattree_exts[] = {CSV_EXT, CSM_EXT, CSI_EXT, NullS};
 
 static int tina_init_func(void *p) {
   handlerton *tina_hton;
@@ -183,14 +186,14 @@ static int tina_init_func(void *p) {
 #endif
 
   tina_hton = (handlerton *)p;
-  mysql_mutex_init(csv_key_mutex_tina, &inv_tina_mutex, MY_MUTEX_INIT_FAST);
+  mysql_mutex_init(csv_key_mutex_tina, &pat_tina_mutex, MY_MUTEX_INIT_FAST);
   tina_open_tables.reset(new collation_unordered_multimap<string, TINA_SHARE *>(
       system_charset_info, csv_key_memory_tina_share));
   tina_hton->state = SHOW_OPTION_YES;
   tina_hton->create = tina_create_handler;
   tina_hton->flags =
       (HTON_CAN_RECREATE | HTON_SUPPORT_LOG_TABLES | HTON_NO_PARTITION);
-  tina_hton->file_extensions = ha_inverted_exts;
+  tina_hton->file_extensions = ha_pattree_exts;
   tina_hton->rm_tmp_tables = default_rm_tmp_tables;
   tina_hton->is_supported_system_table = tina_is_supported_system_table;
   return 0;
@@ -198,7 +201,7 @@ static int tina_init_func(void *p) {
 
 static int tina_done_func(void *) {
   tina_open_tables.reset();
-  mysql_mutex_destroy(&inv_tina_mutex);
+  mysql_mutex_destroy(&pat_tina_mutex);
 
   return 0;
 }
@@ -214,7 +217,7 @@ static TINA_SHARE *get_share(const char *table_name, TABLE *) {
   char *tmp_name;
   uint length;
 
-  mysql_mutex_lock(&inv_tina_mutex);
+  mysql_mutex_lock(&pat_tina_mutex);
   length = (uint)strlen(table_name);
 
   /*
@@ -226,7 +229,7 @@ static TINA_SHARE *get_share(const char *table_name, TABLE *) {
     if (!my_multi_malloc(csv_key_memory_tina_share, MYF(MY_WME | MY_ZEROFILL),
                          &share, sizeof(*share), &tmp_name, length + 1,
                          NullS)) {
-      mysql_mutex_unlock(&inv_tina_mutex);
+      mysql_mutex_unlock(&pat_tina_mutex);
       return nullptr;
     }
 
@@ -271,19 +274,19 @@ static TINA_SHARE *get_share(const char *table_name, TABLE *) {
     
     share->index = new index_share;
     share->index->index_file = mysql_file_open(csv_key_file_index, index_file_name, O_RDWR | O_CREAT, MYF(MY_WME));
-    share->index->dictionary = new unordered_map<string, vector<my_off_t>>;
+    share->index->root = new Node();
     share->index->should_index_all_rows = false;
   } else {
     share = it->second;
   }
 
   share->use_count++;
-  mysql_mutex_unlock(&inv_tina_mutex);
+  mysql_mutex_unlock(&pat_tina_mutex);
 
   return share;
 
 error:
-  mysql_mutex_unlock(&inv_tina_mutex);
+  mysql_mutex_unlock(&pat_tina_mutex);
   my_free(share);
 
   return nullptr;
@@ -400,21 +403,21 @@ static int write_meta_file(File meta_file, ha_rows rows, TINA_SHARE* s, bool dir
   return 0;
 }
 /*
-static int write_index_file(File index_file, inv_index idx) {
+static int write_pattree_file(File index_file, inv_index idx) {
   uchar index_buffer[INDEX_BUFFER_SIZE];
   uchar *ptr = index_buffer;
 
   DBUG_TRACE;
 }
 */
-bool ha_inverted::check_and_repair(THD *thd) {
+bool ha_pattree::check_and_repair(THD *thd) {
   HA_CHECK_OPT check_opt;
   DBUG_TRACE;
 
   return repair(thd, &check_opt);
 }
 
-int ha_inverted::init_tina_writer() {
+int ha_pattree::init_tina_writer() {
   DBUG_TRACE;
 
   /*
@@ -436,7 +439,7 @@ int ha_inverted::init_tina_writer() {
   return 0;
 }
 
-bool ha_inverted::is_crashed() const {
+bool ha_pattree::is_crashed() const {
   DBUG_TRACE;
   return share->crashed;
 }
@@ -446,11 +449,11 @@ bool ha_inverted::is_crashed() const {
 */
 static int free_share(TINA_SHARE *share) {
   DBUG_TRACE;
-  mysql_mutex_lock(&inv_tina_mutex);
+  mysql_mutex_lock(&pat_tina_mutex);
   int result_code = 0;
   if (!--share->use_count) {
     if (share->index->dict_dirty) {
-      write_index(share->index->dictionary, share->index->index_file);
+      write_pattree(share->index->root, share->index->index_file);
       share->index->dict_dirty = false;
     }
     mysql_file_close(share->index->index_file, MYF(0));
@@ -468,7 +471,7 @@ static int free_share(TINA_SHARE *share) {
     mysql_mutex_destroy(&share->mutex);
     my_free(share);
   }
-  mysql_mutex_unlock(&inv_tina_mutex);
+  mysql_mutex_unlock(&pat_tina_mutex);
 
   return result_code;
 }
@@ -509,7 +512,7 @@ static my_off_t find_eoln_buff(Transparent_file *data_buff, my_off_t begin,
 
 static handler *tina_create_handler(handlerton *hton, TABLE_SHARE *table, bool,
                                     MEM_ROOT *mem_root) {
-  return new (mem_root) ha_inverted(hton, table);
+  return new (mem_root) ha_pattree(hton, table);
 }
 
 /**
@@ -545,7 +548,7 @@ static bool tina_is_supported_system_table(const char *db,
   return false;
 }
 
-ha_inverted::ha_inverted(handlerton *hton, TABLE_SHARE *table_arg)
+ha_pattree::ha_pattree(handlerton *hton, TABLE_SHARE *table_arg)
     : handler(hton, table_arg),
       /*
         These definitions are found in handler.h
@@ -570,7 +573,7 @@ ha_inverted::ha_inverted(handlerton *hton, TABLE_SHARE *table_arg)
   Encode a buffer into the quoted format.
 */
 
-int ha_inverted::encode_quote(uchar *) {
+int ha_pattree::encode_quote(uchar *) {
   char attribute_buffer[1024];
   String attribute(attribute_buffer, sizeof(attribute_buffer), &my_charset_bin);
 
@@ -639,7 +642,7 @@ int ha_inverted::encode_quote(uchar *) {
   track of space. Then the chain will be used to cleanup "holes", occurred
   due to deletes and updates.
 */
-int ha_inverted::chain_append() {
+int ha_pattree::chain_append() {
   if (chain_ptr != chain && (chain_ptr - 1)->end == current_position)
     (chain_ptr - 1)->end = next_position;
   else {
@@ -674,7 +677,7 @@ int ha_inverted::chain_append() {
 /*
   Scans for a row.
 */
-int ha_inverted::find_current_row(uchar *buf) {
+int ha_pattree::find_current_row(uchar *buf) {
   my_off_t end_offset, curr_offset = current_position;
   int eoln_len;
   my_bitmap_map *org_bitmap;
@@ -814,7 +817,7 @@ int ha_inverted::find_current_row(uchar *buf) {
       /*
         Here CHECK_FIELD_WARN checks that all values in the csv file are valid
         which is normally the case, if they were written  by
-        INSERT -> ha_inverted::write_row. '0' values on ENUM fields are considered
+        INSERT -> ha_pattree::write_row. '0' values on ENUM fields are considered
         invalid by Field_enum::store() but it can store them on INSERT anyway.
         Thus, for enums we silence the warning, as it doesn't really mean
         an invalid value.
@@ -853,18 +856,18 @@ err:
   for CSV engine. For more details see mysys/thr_lock.c
 */
 
-void inv_tina_get_status(void *param, int) {
-  ha_inverted *tina = (ha_inverted *)param;
+void pat_tina_get_status(void *param, int) {
+  ha_pattree *tina = (ha_pattree *)param;
   tina->get_status();
 }
 
-void inv_tina_update_status(void *param) {
-  ha_inverted *tina = (ha_inverted *)param;
+void pat_tina_update_status(void *param) {
+  ha_pattree *tina = (ha_pattree *)param;
   tina->update_status();
 }
 
 /* this should exist and return 0 for concurrent insert to work */
-bool inv_tina_check_status(void *) { return false; }
+bool pat_tina_check_status(void *) { return false; }
 
 /*
   Save the state of the table
@@ -875,10 +878,10 @@ bool inv_tina_check_status(void *) { return false; }
   DESCRIPTION
     This function is used to retrieve the file length. During the lock
     phase of concurrent insert. For more details see comment to
-    ha_inverted::update_status below.
+    ha_pattree::update_status below.
 */
 
-void ha_inverted::get_status() {
+void ha_pattree::get_status() {
   if (share->is_log_table) {
     /*
       We have to use mutex to follow pthreads memory visibility
@@ -913,7 +916,7 @@ void ha_inverted::get_status() {
     we call update_status() explicitly after each row write.
 */
 
-void ha_inverted::update_status() {
+void ha_pattree::update_status() {
   /* correct local_saved_data_file_length for writers */
   share->saved_data_file_length = local_saved_data_file_length;
 }
@@ -923,7 +926,7 @@ void ha_inverted::update_status() {
   this will not be called for every request. Any sort of positions
   that need to be reset should be kept in the ::extra() call.
 */
-int ha_inverted::open(const char *name, int, uint open_options, const dd::Table *) {
+int ha_pattree::open(const char *name, int, uint open_options, const dd::Table *) {
   DBUG_TRACE;
 
   if (!(share = get_share(name, table))) return HA_ERR_OUT_OF_MEM;
@@ -948,9 +951,9 @@ int ha_inverted::open(const char *name, int, uint open_options, const dd::Table 
   thr_lock_data_init(&share->lock, &lock, (void *)this);
   ref_length = sizeof(my_off_t);
 
-  share->lock.get_status = inv_tina_get_status;
-  share->lock.update_status = inv_tina_update_status;
-  share->lock.check_status = inv_tina_check_status;
+  share->lock.get_status = pat_tina_get_status;
+  share->lock.update_status = pat_tina_update_status;
+  share->lock.check_status = pat_tina_check_status;
 
   return 0;
 }
@@ -959,7 +962,7 @@ int ha_inverted::open(const char *name, int, uint open_options, const dd::Table 
   Close a database file. We remove ourselves from the shared structure.
   If it is empty we destroy it.
 */
-int ha_inverted::close(void) {
+int ha_pattree::close(void) {
   int rc = 0;
   DBUG_TRACE;
   rc = mysql_file_close(data_file, MYF(0));
@@ -971,7 +974,7 @@ int ha_inverted::close(void) {
   of the file and appends the data. In an error case it really should
   just truncate to the original position (this is not done yet).
 */
-int ha_inverted::write_row(uchar *buf) {
+int ha_pattree::write_row(uchar *buf) {
   int size;
   DBUG_TRACE;
 
@@ -1014,7 +1017,7 @@ int ha_inverted::write_row(uchar *buf) {
   return 0;
 }
 
-int ha_inverted::open_update_temp_file_if_needed() {
+int ha_pattree::open_update_temp_file_if_needed() {
   char updated_fname[FN_REFLEN];
 
   if (!share->update_file_opened) {
@@ -1038,7 +1041,7 @@ int ha_inverted::open_update_temp_file_if_needed() {
   This will be called in a table scan right before the previous ::rnd_next()
   call.
 */
-int ha_inverted::update_row(const uchar *, uchar *new_data) {
+int ha_pattree::update_row(const uchar *, uchar *new_data) {
   int size;
   int rc = -1;
   DBUG_TRACE;
@@ -1082,7 +1085,7 @@ err:
   The table will then be deleted/positioned based on the ORDER (so RANDOM,
   DESC, ASC).
 */
-int ha_inverted::delete_row(const uchar *) {
+int ha_pattree::delete_row(const uchar *) {
   DBUG_TRACE;
   ha_statistic_increment(&System_status_var::ha_delete_count);
 
@@ -1114,7 +1117,7 @@ int ha_inverted::delete_row(const uchar *) {
   @retval  1  There was an error.
 */
 
-int ha_inverted::init_data_file() {
+int ha_pattree::init_data_file() {
   if (local_data_file_version != share->data_file_version) {
     local_data_file_version = share->data_file_version;
     if (mysql_file_close(data_file, MYF(0)) ||
@@ -1130,23 +1133,23 @@ int ha_inverted::init_data_file() {
   All table scans call this first.
   The order of a table scan is:
 
-  ha_inverted::store_lock
-  ha_inverted::external_lock
-  ha_inverted::info
-  ha_inverted::rnd_init
-  ha_inverted::extra
-  ha_inverted::rnd_next
-  ha_inverted::rnd_next
-  ha_inverted::rnd_next
-  ha_inverted::rnd_next
-  ha_inverted::rnd_next
-  ha_inverted::rnd_next
-  ha_inverted::rnd_next
-  ha_inverted::rnd_next
-  ha_inverted::rnd_next
-  ha_inverted::extra
-  ha_inverted::external_lock
-  ha_inverted::extra
+  ha_pattree::store_lock
+  ha_pattree::external_lock
+  ha_pattree::info
+  ha_pattree::rnd_init
+  ha_pattree::extra
+  ha_pattree::rnd_next
+  ha_pattree::rnd_next
+  ha_pattree::rnd_next
+  ha_pattree::rnd_next
+  ha_pattree::rnd_next
+  ha_pattree::rnd_next
+  ha_pattree::rnd_next
+  ha_pattree::rnd_next
+  ha_pattree::rnd_next
+  ha_pattree::extra
+  ha_pattree::external_lock
+  ha_pattree::extra
   ENUM HA_EXTRA_RESET   Reset database to after open
 
   Each call to ::rnd_next() represents a row returned in the can. When no more
@@ -1155,7 +1158,7 @@ int ha_inverted::init_data_file() {
 
 */
 
-int ha_inverted::rnd_init(bool) {
+int ha_pattree::rnd_init(bool) {
   DBUG_TRACE;
 
   /* set buffer to the beginning of the file */
@@ -1183,7 +1186,7 @@ int ha_inverted::rnd_init(bool) {
   NULL and "". This is ok since this table handler is for spreadsheets and
   they don't know about them either :)
 */
-int ha_inverted::rnd_next(uchar *buf) {
+int ha_pattree::rnd_next(uchar *buf) {
   int rc;
   DBUG_TRACE;
 
@@ -1228,7 +1231,7 @@ end:
   its just a position. Look at the bdb code if you want to see a case
   where something other then a number is stored.
 */
-void ha_inverted::position(const uchar *) {
+void ha_pattree::position(const uchar *) {
   DBUG_TRACE;
   my_store_ptr(ref, ref_length, current_position);
 }
@@ -1238,7 +1241,7 @@ void ha_inverted::position(const uchar *) {
   my_get_ptr() retrieves the data for you.
 */
 
-int ha_inverted::rnd_pos(uchar *buf, uchar *pos) {
+int ha_pattree::rnd_pos(uchar *buf, uchar *pos) {
   int rc;
   DBUG_TRACE;
   ha_statistic_increment(&System_status_var::ha_read_rnd_count);
@@ -1252,7 +1255,7 @@ int ha_inverted::rnd_pos(uchar *buf, uchar *pos) {
   Currently this table handler doesn't implement most of the fields
   really needed. SHOW also makes use of this data
 */
-int ha_inverted::info(uint) {
+int ha_pattree::info(uint) {
   DBUG_TRACE;
   /* This is a lie, but you don't want the optimizer to see zero or 1 */
   if (!records_is_known && stats.records < 2) stats.records = 2;
@@ -1264,7 +1267,7 @@ int ha_inverted::info(uint) {
   HA_EXTRA_RESET and HA_EXTRA_RESET_STATE are the most frequently called.
   You are not required to implement any of these.
 */
-int ha_inverted::extra(enum ha_extra_function operation) {
+int ha_pattree::extra(enum ha_extra_function operation) {
   DBUG_TRACE;
   if (operation == HA_EXTRA_MARK_AS_LOG_TABLE) {
     mysql_mutex_lock(&share->mutex);
@@ -1279,7 +1282,7 @@ int ha_inverted::extra(enum ha_extra_function operation) {
   to the given "hole", stored in the buffer. "Valid" here means,
   not listed in the chain of deleted records ("holes").
 */
-bool ha_inverted::get_write_pos(my_off_t *end_pos, tina_set *closest_hole) {
+bool ha_pattree::get_write_pos(my_off_t *end_pos, tina_set *closest_hole) {
   if (closest_hole == chain_ptr) /* no more chains */
     *end_pos = file_buff->end();
   else
@@ -1293,7 +1296,7 @@ bool ha_inverted::get_write_pos(my_off_t *end_pos, tina_set *closest_hole) {
   slots to clean up all of the dead space we have collected while
   performing deletes/updates.
 */
-int ha_inverted::rnd_end() {
+int ha_pattree::rnd_end() {
   char updated_fname[FN_REFLEN];
   my_off_t file_buffer_start = 0;
   DBUG_TRACE;
@@ -1433,7 +1436,7 @@ error:
          rows (after the first bad one) as well.
 */
 
-int ha_inverted::repair(THD *thd, HA_CHECK_OPT *) {
+int ha_pattree::repair(THD *thd, HA_CHECK_OPT *) {
   char repaired_fname[FN_REFLEN];
   uchar *buf;
   File repair_file;
@@ -1557,7 +1560,7 @@ end:
   DELETE without WHERE calls this
 */
 
-int ha_inverted::delete_all_rows() {
+int ha_pattree::delete_all_rows() {
   int rc;
   DBUG_TRACE;
 
@@ -1585,7 +1588,7 @@ int ha_inverted::delete_all_rows() {
   Called by the database to lock the table. Keep in mind that this
   is an internal lock.
 */
-THR_LOCK_DATA **ha_inverted::store_lock(THD *, THR_LOCK_DATA **to,
+THR_LOCK_DATA **ha_pattree::store_lock(THD *, THR_LOCK_DATA **to,
                                     enum thr_lock_type lock_type) {
   if (lock_type != TL_IGNORE && lock.type == TL_UNLOCK) lock.type = lock_type;
   *to++ = &lock;
@@ -1597,7 +1600,7 @@ THR_LOCK_DATA **ha_inverted::store_lock(THD *, THR_LOCK_DATA **to,
   this (the database will call ::open() if it needs to).
 */
 
-int ha_inverted::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *,
+int ha_pattree::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *,
                     dd::Table *) {
   char name_buff[FN_REFLEN];
   File create_file;
@@ -1655,7 +1658,7 @@ int ha_inverted::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *,
   return 0;
 }
 
-int ha_inverted::check(THD *thd, HA_CHECK_OPT *) {
+int ha_pattree::check(THD *thd, HA_CHECK_OPT *) {
   int rc = 0;
   uchar *buf;
   const char *old_proc_info;
@@ -1699,19 +1702,19 @@ int ha_inverted::check(THD *thd, HA_CHECK_OPT *) {
   return HA_ADMIN_OK;
 }
 
-bool ha_inverted::check_if_incompatible_data(HA_CREATE_INFO *, uint) {
+bool ha_pattree::check_if_incompatible_data(HA_CREATE_INFO *, uint) {
   return COMPATIBLE_DATA_YES;
 }
 
 /* start exclusively modified code though i guess i could just diff it */
-bool ha_inverted::is_text_field(enum_field_types type) {
+bool ha_pattree::is_text_field(enum_field_types type) {
   DBUG_TRACE;
   return (type == MYSQL_TYPE_VARCHAR ||
    type == MYSQL_TYPE_VAR_STRING ||
    type == MYSQL_TYPE_STRING);
 }
 
-void instantiate_index(unordered_map<string, vector<my_off_t>> *dictionary, File index_file) {
+void instantiate_pattree(Node *root, File index_file) {
   char index_buffer[INDEX_BUFFER_SIZE];
   char *ptr;
 
@@ -1734,53 +1737,33 @@ void instantiate_index(unordered_map<string, vector<my_off_t>> *dictionary, File
       ++row_offset;
     }
     ++ptr; // move past ,
+    ++row_offset;
     *word_ptr = '\0';
     string word = string(word_buffer);
-    if (!dictionary->contains(word))
-      dictionary->insert({ word, { } });
     my_off_t found_offset;
     for (; *ptr != '\n'; ptr += (ULL_BASE_10_MAX_LENGTH * sizeof(char))) {
       *(ptr + (ULL_BASE_10_MAX_LENGTH * sizeof(char))) = '\0';
       found_offset = (my_off_t) strtoull(ptr, NULL, 10);
-      dictionary->at(word).push_back(found_offset);
+      insert_element_internal(root, word, found_offset);
       ++ptr; // skip ','
-      row_offset += ((ULL_BASE_10_MAX_LENGTH + 3) * sizeof(char)); // skip ',' '\n'
+      ++row_offset;
+      row_offset += ((ULL_BASE_10_MAX_LENGTH) * sizeof(char)); // skip ','
     }
     ++ptr; // skip '\n'
+    ++row_offset;
     if (*ptr == -1)
       break;
   }
 }
 
-void write_index(unordered_map<string, vector<my_off_t>> *dictionary, File index_file) {
-  char index_buffer[INDEX_BUFFER_SIZE];
-  char *ptr = index_buffer;
+void write_pattree(Node *root, File index_file) {
+  string serialised = serialise_tree(root, "");
+  serialised.erase(0, 1); //remove the first \n
+  serialised.push_back((char) -1); // stop char
+  serialised.push_back('\n');
+  char *ptr = serialised.data();
 
-  DBUG_TRACE;
-
-  mysql_file_seek(index_file, 0, MY_SEEK_SET, MYF(0));
-
-  for (const auto & [path, idx] : *dictionary) {
-    std::memcpy(ptr, path.data(), path.length());
-    ptr += path.size();
-    *ptr = ',';
-    ++ptr;
-    for (const my_off_t& i : idx) {
-      char offset[ULL_BASE_10_MAX_LENGTH + 1];
-      snprintf(offset, ULL_BASE_10_MAX_LENGTH + 1, "%20llu", (ulonglong) i);
-      std::memcpy(ptr, offset, (ULL_BASE_10_MAX_LENGTH + 1) * sizeof(char));
-      ptr += ULL_BASE_10_MAX_LENGTH * sizeof(char);
-      *ptr = ',';
-      ++ptr;
-    }
-    *ptr = '\n';
-    ++ptr;
-  }
-  *ptr = -1;
-  ++ptr;
-  *ptr = '\n'; // it gets annoyed if we end on 0xFF when reading back
-
-  mysql_file_write(index_file, (uchar*) index_buffer, INDEX_BUFFER_SIZE, 0);
+  mysql_file_write(index_file, (uchar*) ptr, INDEX_BUFFER_SIZE, 0);
 }
 
 static float inverted_fts_retrieve_ranking(FT_INFO*) {
@@ -1801,7 +1784,7 @@ static float inverted_fts_find_ranking(FT_INFO *, uchar * uc, uint ui) {
 
 const struct _ft_vft ft_vft_result = {nullptr, inverted_fts_find_ranking, inverted_fts_close_ranking, inverted_fts_retrieve_ranking, nullptr};
 
-FT_INFO* ha_inverted::ft_init_ext(uint flags, uint inx, String *key) {
+FT_INFO* ha_pattree::ft_init_ext(uint flags, uint inx, String *key) {
   DBUG_TRACE;
   DBUG_PRINT("info", ("init fulltext idx with flags %X , index %d , key %s", flags, inx, key->c_ptr()));
   FT_INFO* fts_hdl = nullptr;
@@ -1817,21 +1800,21 @@ FT_INFO* ha_inverted::ft_init_ext(uint flags, uint inx, String *key) {
   return fts_hdl;
 }
 
-int ha_inverted::ft_init() {
+int ha_pattree::ft_init() {
   DBUG_TRACE;
   if (!(share->has_index)) {
-    instantiate_index(share->index->dictionary, share->index->index_file);
+    instantiate_pattree(share->index->root, share->index->index_file);
     share->has_index = true;
   }
   return rnd_init();
 }
 
-int ha_inverted::ft_read(uchar* buf) {
+int ha_pattree::ft_read(uchar* buf) {
   DBUG_TRACE;
   DBUG_PRINT("info", ("ft_read with buf: [%p] %s", buf, buf));
-  if (share->index->dictionary->count(share->index->last_key) == 0)
+  vector<my_off_t> offsets = find_element(share->index->root, share->index->last_key);
+  if (offsets.size() == 0)
     return HA_ERR_END_OF_FILE;
-  vector<my_off_t> offsets = share->index->dictionary->at(share->index->last_key);
   if ((size_t) (share->index->positions_read + 1) > offsets.size())
     return HA_ERR_END_OF_FILE;
   my_off_t pos = offsets.at(share->index->positions_read);
@@ -1841,28 +1824,143 @@ int ha_inverted::ft_read(uchar* buf) {
   return rc;
 }
 
-int ha_inverted::read_row_into_buffer(uchar *buf) {
+int ha_pattree::read_row_into_buffer(uchar *buf) {
   return find_current_row(buf);
 }
 
 /**
- * Insert a word in file into the dictionary
+ * Insert a word in file into the tree
  */
-void ha_inverted::insert_element(const string word, const my_off_t offset) {
+void ha_pattree::insert_element(const string word, const my_off_t offset) {
     DBUG_TRACE;
     DBUG_PRINT("info", ("Got %s at %llu", word.c_str(), offset));
 
-    if (share->index->dictionary->contains(word)) {
-        share->index->dictionary->at(word).push_back(offset);
+    insert_element_internal(share->index->root, word, offset);
+}
+
+vector<my_off_t> ha_pattree::find_element(Node* root, const string str) {
+  Node* current = root;
+
+  for (size_t i = 0; i < str.size(); ++i) {
+    Node* child = find_child(current, str[i]);
+    if (child == nullptr) {
+      // No child with the given character
+      return vector<unsigned long long>();
     } else {
-        share->index->dictionary->insert({ word, { offset } });
+      // Check common prefix and traverse down the tree
+      std::string key = child->key;
+      size_t j = 0;
+      while (j < key.size() && i < str.size() && key[j] == str[i]) {
+        ++i;
+        ++j;
+      }
+      if (j < key.size()) {
+        if (i == str.length()) {
+          return current->offsets;
+        } else {
+          return find_element(current, str.substr(i, str.length()));
+        }
+        break;
+      } else if (i == str.size()) {
+        // Reached the end of key, mark the node as leaf
+        return child->offsets;
+        break;
+      } else {
+        // Traverse down the tree
+        current = child;
+        // we haven't made progress this step; decrement
+        --i;
+      }
     }
+  }
+
+  return vector<unsigned long long>();
+}
+
+void insert_element_internal(Node* root, const string word, const my_off_t offset) {
+  Node* current = root;
+
+  for (size_t i = 0; i < word.size(); ++i) {
+    Node* child = find_child(current, word[i]);
+    if (child == nullptr) {
+      // No child with the given character, create a new node
+      Node* newNode = new Node(word.substr(i));
+      newNode->offsets.push_back(offset);
+      current->children.push_back(newNode);
+      current = newNode;
+      break;
+    } else {
+      // Check common prefix and traverse down the tree
+      std::string key = child->key;
+      size_t j = 0;
+      while (j < key.size() && i < word.size() && key[j] == word[i]) {
+        ++i;
+        ++j;
+      }
+      if (j < key.size()) {
+        // Split the existing node
+        Node* newNode = new Node(key.substr(j));
+        newNode->children = child->children;
+        newNode->offsets = child->offsets;
+        child->key = key.substr(0, j);
+        child->offsets.clear();
+        child->children.clear();
+        child->children.push_back(newNode);
+        current = child;
+        if (i == word.length()) {
+          current->offsets.push_back(offset);
+        } else {
+          insert_element_internal(current, word.substr(i, word.length()), offset);
+        }
+        break;
+      } else if (i == word.size()) {
+        // Reached the end of key, mark the node as leaf
+        child->offsets.push_back(offset);
+        break;
+      } else {
+        // Traverse down the tree
+        current = child;
+        // we haven't made progress this step; decrement
+        --i;
+      }
+    }
+  }
+}
+
+Node* find_child(Node* parent, char ch) {
+  for (Node* child : parent->children) {
+    if (child->key[0] == ch) {
+      return child;
+    }
+  }
+  return nullptr;
+}
+
+string serialise_tree(Node *root, string prefix) {
+  string full_name = prefix;
+  full_name.append(root->key);
+  string result;
+  if (root->offsets.size() > 0) {
+    result.append(full_name);
+    result.append(",");
+    for (auto off : root->offsets) {
+      string offset(ULL_BASE_10_MAX_LENGTH, '\0');
+      snprintf(offset.data(), ULL_BASE_10_MAX_LENGTH + 1, "%20llu", off);
+      result.append(offset);
+      result.append(",");
+    }
+  }
+  result.append("\n");
+  for (auto child : root->children) {
+    result.append(serialise_tree(child, full_name));
+  }
+  return result;
 }
 
 /**
- * Read a file in and insert its elements into a dictionary
+ * Read a file in and insert its elements into the tree
  */
-void ha_inverted::read_and_index(const string text, const my_off_t offset) {
+void ha_pattree::read_and_index(const string text, const my_off_t offset) {
     string word;
     std::stringstream ss(text);
     DBUG_TRACE;
@@ -1873,7 +1971,7 @@ void ha_inverted::read_and_index(const string text, const my_off_t offset) {
 }
 
 // split text into words to look up
-vector<string> ha_inverted::split(const string input) {
+vector<string> ha_pattree::split(const string input) {
   vector<string> result;
   std::stringstream ss(input);
   string word;
@@ -1885,15 +1983,15 @@ vector<string> ha_inverted::split(const string input) {
 
 /* end exclusively modified code */
 
-struct st_mysql_storage_engine inv_storage_engine = {
+struct st_mysql_storage_engine pat_storage_engine = {
     MYSQL_HANDLERTON_INTERFACE_VERSION};
 
-mysql_declare_plugin(inverted){
+mysql_declare_plugin(pattree){
     MYSQL_STORAGE_ENGINE_PLUGIN,
-    &inv_storage_engine,
-    "INVERTED",
-    PLUGIN_AUTHOR_ORACLE,
-    "Inverted storage engine",
+    &pat_storage_engine,
+    "PATTREE",
+    "S Bird, A Lewis, S Liu",
+    "PAT Tree storage engine",
     PLUGIN_LICENSE_GPL,
     tina_init_func, /* Plugin Init */
     nullptr,        /* Plugin check uninstall */
